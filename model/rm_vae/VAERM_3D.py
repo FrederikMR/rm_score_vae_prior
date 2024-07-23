@@ -34,16 +34,14 @@ class VAEOutput(NamedTuple):
   z_prior:Array
   dW_prior:Array
   dt_prior:Array
-  G_mu_zx:Array
-  G_mu_z:Array
 
-#%% Other
+#%% Score Net
 
 @dataclasses.dataclass
 class ScoreNet(hk.Module):
     
     dim:int
-    layers:list
+    layers:List
     
     def model(self)->object:
         
@@ -52,7 +50,7 @@ class ScoreNet(hk.Module):
             model.append(hk.Linear(l, w_init=jnp.zeros, b_init=jnp.zeros))
             model.append(tanh)
             
-        model.append(hk.Linear(self.dim))
+        model.append(hk.Linear(self.dim, w_init=jnp.zeros, b_init=jnp.zeros))
         
         return hk.Sequential(model)
 
@@ -71,55 +69,110 @@ class ScoreNet(hk.Module):
       
         return self.model()(x)+grad_euc
 
+#%% Encoder
+
 @dataclasses.dataclass
 class Encoder(hk.Module):
         
+    encoder_layers:List = [100, 100]
+    mu_layers:List = []
+    log_t_layers:List = []
     latent_dim : int = 2
     init:hk.initializers = hk.initializers.RandomNormal()
     
-    def mu_layer(self, z:Array)->Array:
-
-        return hk.Linear(output_size=self.latent_dim, w_init=self.init, b_init=self.init)(z)
-    
-    def log_t_layer(self, z:Array)->Array:
+    def encoder_model(self)->object:
         
-        return hk.Linear(output_size=1, w_init=jnp.zeros, b_init=jnp.zeros)(z)
+        model = []
+        for l in self.encoder_layers:
+            model.append(hk.Linear(l, w_init=self.init, b_init=self.init))
+            model.append(swish)
+        
+        return hk.Sequential(model)
+    
+    def mu_model(self)->Array:
+        
+        model = []
+        for l in self.mu_layers:
+            model.append(hk.Linear(l, w_init=self.init, b_init=self.init))
+            model.append(swish)
+            
+        model.append(hk.Linear(self.latent_dim, w_init=self.init, b_init=self.init))
+        
+        return hk.Sequential(model)
+    
+    def log_t_model(self)->Array:
+        
+        model = []
+        for l in self.log_t_layers:
+            model.append(hk.Linear(l, w_init=jnp.zeros, b_init=jnp.zeros))
+            model.append(swish)
+            
+        model.append(hk.Linear(self.latent_dim, w_init=jnp.zeros, b_init=jnp.zeros))
+        
+        return hk.Sequential(model)
 
     def __call__(self, x:Array) -> Tuple[Array, Array]:
 
         x = x.reshape(-1,3)
-        
-        x = swish(hk.Linear(output_size=100, b_init=self.init)(x))
-        x = swish(hk.Linear(output_size=100, b_init=self.init)(x))
+        x_encoded = self.encoder_model()(x)
 
-        mu_zx = self.mu_layer(x)
-        log_t_zx = self.log_t_layer(x)
+        mu_zx = self.mu_model()(x_encoded)
+        log_t_zx = self.log_t_model()(x_encoded)
 
         return mu_zx, log_t_zx
+    
+#%% Decoder
 
 @dataclasses.dataclass
 class Decoder(hk.Module):
   """Decoder model."""
+  decoder_layers:List = [100]
+  mu_layers:List = []
+  log_sigma_layers:List = []
+  embedded_dim:int = 3
   init:hk.initializers = hk.initializers.RandomNormal()
   
-  def mu_layer(self, z:Array)->Array:
+  def decoder_model(self)->object:
       
-      return hk.Linear(output_size=3, w_init=self.init, b_init=self.init)(z)
+      model = []
+      for l in self.decoder_layers:
+          model.append(hk.Linear(l, w_init=self.init, b_init=self.init))
+          model.append(swish)
+      
+      return hk.Sequential(model)
   
-  def log_sigma_layer(self, z:Array)->Array:
+  def mu_model(self)->Array:
       
-      log_sigma = hk.Linear(output_size=1, w_init=jnp.zeros, b_init=jnp.zeros)(z)
+      model = []
+      for l in self.mu_layers:
+          model.append(hk.Linear(l, w_init=self.init, b_init=self.init))
+          model.append(swish)
+          
+      model.append(hk.Linear(self.embedded_dim, w_init=self.init, b_init=self.init))
       
-      return jnp.tile(log_sigma, (1,3))
+      return hk.Sequential(model)
+  
+  def log_sigma_model(self)->Array:
+      
+      model = []
+      for l in self.log_sigma_layers:
+          model.append(hk.Linear(l, w_init=jnp.zeros, b_init=jnp.zeros))
+          model.append(swish)
+          
+      model.append(hk.Linear(self.embedded_dim, w_init=jnp.zeros, b_init=jnp.zeros))
+      
+      return hk.Sequential(model)
 
   def __call__(self, z: Array) -> Tuple[Array,Array]:
       
-        z = swish(hk.Linear(output_size=100, w_init=self.init, b_init=self.init)(z))
+        x_decoded = self.decoder_model()(z)
 
-        mu_xz = self.mu_layer(z)
-        log_sigma_xz = self.log_sigma_layer(z)
+        mu_xz = self.mu_model()(x_decoded)
+        log_sigma_xz = self.log_sigma_model()(x_decoded)
         
         return mu_xz, log_sigma_xz
+    
+#%% Prior Layer
     
 class PriorLayer(hk.Module):
 
@@ -132,9 +185,12 @@ class PriorLayer(hk.Module):
     #w_init = hk.initializers.TruncatedNormal(1. / np.sqrt(j))
     #w = hk.get_parameter("w", shape=[j, k], dtype=x.dtype, init=w_init)
     b = hk.get_parameter("b", shape=[self.output_size], dtype=x.dtype, init=jnp.zeros)
+    
     return b
 
-class VAEBM(hk.Module):
+#%% Riemannian Score Variational Prior
+
+class VAERM(hk.Module):
     def __init__(self,
                  encoder:Encoder,
                  decoder:Decoder,
@@ -147,22 +203,13 @@ class VAEBM(hk.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.key = jrandom.key(seed)
-        self.sample_method = sample_method
+        if sample_method not in ['Local', 'Taylor', 'Euclidean']:
+            raise ValueError("Invalid sampling method. Choose either: Local, Taylor, Euclidean")
+        else:
+            self.sample_method = sample_method
         self.dt_steps = dt_steps
         
-    def muz(self, z:Array)->Array:
-        
-        mu_z = PriorLayer(output_size=z.shape[-1])(z)
-
-        return mu_z*jnp.ones_like(z)
-    
-    def log_tz(self, z:Array)->Array:
-        
-        log_t_z = PriorLayer(output_size=1)(z)
-
-        return log_t_z*jnp.ones((z.shape[0],1))
-        
-    def dts(self, T:float=1.0,n_steps:int=1000)->Array:
+    def dts(self, T:float,n_steps:int)->Array:
         """time increments, deterministic"""
         return jnp.array([T/n_steps]*n_steps)
 
@@ -181,137 +228,153 @@ class VAEBM(hk.Module):
         else:
             return vmap(lambda subkey: jnp.sqrt(_dts)[:,None]*jrandom.normal(subkey,(_dts.shape[0],d)))(subkeys) 
         
-    def Jmu(self,z):
-
-        return jacfwd(lambda z: self.decoder(z.reshape(-1,2))[0])(z)
-    
-    def Jsigma(self,z):
-
-        return jacfwd(lambda z: self.decoder(z.reshape(-1,2))[1])(z)
+    def JF(self,z:Array)->Array:
         
-    def G(self,z):
-
-        Jmu = self.Jmu(z).squeeze()
-        Jsigma = self.Jsigma(z).squeeze()
+        return jacfwd(self.F)(z)
         
-        return jnp.dot(Jmu.T,Jmu)+jnp.dot(Jsigma.T, Jsigma)
+    def G(self,z:Array)->Array:
+        
+        JF = self.JF(z)
+        
+        return jnp.einsum('...ik,...il->...kl', JF, JF)
     
-    def DG(self,z):
+    def DG(self,z:Array)->Array:
         
         return jacfwd(self.G)(z)
     
-    def Ginv(self,z):
+    def Ginv(self,z:Array)->Array:
         
         return jnp.linalg.inv(self.G(z))
     
-    def Chris(self,z):
+    def Chris(self,z:Array)->Array:
         
         Dgx = self.DG(z)
         gsharpx = self.Ginv(z)
-        return 0.5*(jnp.einsum('im,kml->ikl',gsharpx,Dgx)
-                   +jnp.einsum('im,lmk->ikl',gsharpx,Dgx)
-                   -jnp.einsum('im,klm->ikl',gsharpx,Dgx))
+        
+        return 0.5*(jnp.einsum('...im,...kml->...ikl',gsharpx,Dgx)
+                   +jnp.einsum('...im,...lmk->...ikl',gsharpx,Dgx)
+                   -jnp.einsum('...im,...klm->...ikl',gsharpx,Dgx))
     
-    def euclidean_sample(self, mu:Array, log_t:Array):
+    def sample(self, mu:Array, log_t:Array):
         
-        t = jnp.exp(log_t)
-        eps = jrandom.normal(hk.next_rng_key(), mu.shape)
-        dt = hk.vmap(lambda t: self.dts(t**2,self.dt_steps), split_rng=False)(t).squeeze().T
+        def euclidean_sample(mu:Array, log_t:Array):
+            
+            t = jnp.exp(log_t)
+            eps = jrandom.normal(hk.next_rng_key(), mu.shape)
+            dt = hk.vmap(lambda t: self.dts(t**2,self.dt_steps), split_rng=False)(t).squeeze().T
+            
+            return mu+t*eps, eps, dt[-1]
         
-        return mu+t*eps, eps, dt[-1]
-    
-    def taylor_sample(self, mu:Array, log_t:Array):
-        
-        def sample(carry, step):
-            
-            t,z = carry
-            dt, dW = step
-            
-            t += dt
-            ginv = self.Ginv(z)
-            
-            stoch = jnp.dot(ginv, dW)
-            z += stoch
-            
-            t = t.astype(carry[0].dtype)
-            z = z.astype(carry[1].dtype)
-            
-            return ((t,z),)*2
-        
-        t = jnp.exp(2*log_t)
-        dt = hk.vmap(lambda t: self.dts(t,self.dt_steps), split_rng=False)(t).squeeze().T
-        N_data = mu.shape[0]
-        dW = hk.vmap(lambda dt: self.dWs(self.encoder.latent_dim,dt),
-                     split_rng=False)(dt).reshape(-1,N_data,self.encoder.latent_dim)
-        
-        #vmap(lambda mu,dt,dW: lax.scan(step, init=(mu,0.0), xs=(dt,dW)))(mu,dt,jnp.transpose(dW, axis=(1,0,2)))
-        val, _ =hk.scan(lambda carry, step: hk.vmap(lambda t,z,dt,dW: sample((t,z),(dt,dW)),
-                                                        split_rng=False)(carry[0],carry[1],step[0],step[1]),
-                         init=(jnp.zeros_like(t),mu), xs=(dt,dW)
-                         )
+        def taylor_sample(z:Array, step:Tuple[Array, Array, Array])->Tuple[Array, Array]:
 
-        return val[1], dW[-1], dt[-1]
-    
-    def local_sample(self, mu:Array, log_t:Array)->Array:
+            dt, t, dW = step
+
+            ginv = self.Ginv(z)
+            z += jnp.einsum('...ik,...k->...i', ginv, dW)
+            z = z.astype(self.dtype)
+            
+            return (z,)*2
         
-        def sample(carry, step):
-            
-            t,z = carry
-            dt, dW = step
-            
-            t += dt
+        def local_sample(z:Array, step:Tuple[Array,Array,Array])->Tuple[Array,Array]:
+
+            dt, t, dW = step
+
             ginv = self.Ginv(z)
             Chris = self.Chris(z)
-
-            stoch = jnp.dot(ginv, dW)
-            det = 0.5*jnp.einsum('jk,ijk->i', ginv, Chris)
+            
+            stoch = jnp.einsum('...ik,...k->...i', ginv, dW)
+            det = 0.5*jnp.einsum('...jk,...ijk->...i', ginv, Chris)
             z += det+stoch
+            z = z.astype(self.dtype)
             
-            t = t.astype(carry[0].dtype)
-            z = z.astype(carry[1].dtype)
+            return (z,)*2
+
+        if self.sample_method == 'Taylor':
+            sample_step = taylor_sample
+        elif self.sample_method == "Local":
+            sample_step = local_sample
+        elif self.sample_method == 'Euclidean':
+            return euclidean_sample(mu, log_t)
             
-            return ((t,z),)*2
-        
         t = jnp.exp(2*log_t)
         dt = hk.vmap(lambda t: self.dts(t,self.dt_steps), split_rng=False)(t).squeeze().T
-        N_data = mu.shape[0]
+        t_grid = jnp.cumsum(dt, axis=-1)
+        
         dW = hk.vmap(lambda dt: self.dWs(self.encoder.latent_dim,dt),
-                     split_rng=False)(dt).reshape(-1,N_data,self.encoder.latent_dim)
+                     split_rng=False)(dt).reshape(self.dt_steps,-1,self.encoder.latent_dim)
+        
+        _, mut = hk.scan(sample_step, init=mu, xs=(dt, t_grid, dW))
 
-        val, _ =hk.scan(lambda carry, step: hk.vmap(lambda t,z,dt,dW: sample((t,z),(dt,dW)), 
-                                                        split_rng=False)(carry[0],carry[1],step[0],step[1]),
-                         init=(jnp.zeros_like(t),mu), xs=(dt,dW)
-                         )
+        return mut, dW[-1], dt[-1]
+    
+    def muz(self, z:Array)->Array:
+        
+        mu_z = PriorLayer(output_size=z.shape[-1])(z)
 
-        return val[1], dW[-1], dt[-1]
+        return mu_z*jnp.ones_like(z)
+    
+    def log_tz(self, z:Array)->Array:
+        
+        log_t_z = PriorLayer(output_size=1)(z)
+
+        return log_t_z*jnp.ones((z.shape[0],1))
 
     def __call__(self, x: Array) -> VAEOutput:
         """Forward pass of the variational autoencoder."""
-        x = x.astype(jnp.float32)
         mu_zx, log_t_zx = self.encoder(x)
-        
-        if self.sample_method == 'Local':
-            z, dW, dt = self.local_sample(mu_zx, log_t_zx)
-            mu_z, log_t_z = self.muz(z), self.log_tz(z)
-            z_prior, dW_prior, dt_prior = self.local_sample(mu_z, log_t_z)
-        elif self.sample_method == 'Taylor':
-            z, dW, dt = self.taylor_sample(mu_zx, log_t_zx)
-            mu_z, log_t_z = self.muz(z), self.log_tz(z)
-            z_prior, dW_prior, dt_prior = self.taylor_sample(mu_z, log_t_z)
-        elif self.sample_method == 'Euclidean':
-            z, dW, dt = self.euclidean_sample(mu_zx, log_t_zx)
-            mu_z, log_t_z = self.muz(z), self.log_tz(z)
-            z_prior, dW_prior, dt_prior = self.euclidean_sample(mu_z, log_t_z)
-        else:
-            raise ValueError("Invalid sampling method. Choose either: Local, Taylor, Euclidean")
+
+        z, dW, dt = self.sample(mu_zx, log_t_zx)
+        mu_z, log_t_z = self.muz(z), self.log_tz(z)
+        z_prior, dW_prior, dt_prior = self.sample(mu_z, log_t_z)
             
         mu_xz, log_sigma_xz = self.decoder(z)
-        G_z = self.G(z)
-        G_mu_zx = self.G(mu_zx)
-        G_mu_z = self.G(mu_z)
         
         return VAEOutput(z, mu_xz, log_sigma_xz, mu_zx, log_t_zx, mu_z, log_t_z, dW, dt,
-                         z_prior, dW_prior, dt_prior, G_mu_zx, G_mu_z)
+                         z_prior, dW_prior, dt_prior)
+    
+#%% Riemannian Metric
+
+class VAEG(hk.Module):
+    def __init__(self,
+                 encoder:Encoder,
+                 decoder:Decoder,
+                 ):
+        super(VAEBM, self).__init__()
+
+        self.encoder = encoder
+        self.decoder = decoder
+        
+    def JF(self,z:Array)->Array:
+        
+        return jacfwd(self.F)(z)
+        
+    def G(self,z:Array)->Array:
+        
+        JF = self.JF(z)
+        
+        return jnp.einsum('...ik,...il->...kl', JF, JF)
+    
+    def DG(self,z:Array)->Array:
+        
+        return jacfwd(self.G)(z)
+    
+    def Ginv(self,z:Array)->Array:
+        
+        return jnp.linalg.inv(self.G(z))
+    
+    def Chris(self,z:Array)->Array:
+        
+        Dgx = self.DG(z)
+        gsharpx = self.Ginv(z)
+        
+        return 0.5*(jnp.einsum('...im,...kml->...ikl',gsharpx,Dgx)
+                   +jnp.einsum('...im,...lmk->...ikl',gsharpx,Dgx)
+                   -jnp.einsum('...im,...klm->...ikl',gsharpx,Dgx))
+
+    def __call__(self, z: Array) -> VAEOutput:
+        """Forward pass of the metric tensor."""
+        
+        return self.G(z)
 
 #%% Transformed model
     
@@ -324,6 +387,18 @@ def vae_model(x):
     )
   
     return vae(x)
+
+#%% Transformed metric
+    
+@hk.transform
+def g_model(x):
+    
+    g = VAEG(
+    encoder=Encoder(latent_dim=2),
+    decoder=Decoder(),
+    )
+  
+    return g(x)
 
 #%% Transformed Encoder model
     

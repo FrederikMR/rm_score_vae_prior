@@ -10,29 +10,7 @@ Created on Fri Sep  8 13:05:23 2023
 
 #%% Modules
 
-#jax
-import jax.numpy as jnp
-import jax.random as jrandom
-from jax import jit, lax, vmap, jacfwd, tree_leaves, tree_map, tree_flatten, tree_unflatten
-
-#numpy
-import numpy as np
-
-#random
-import random
-
-#functools
-from functools import partial
-
-#os
-import os
-
-#pickle
-import pickle
-
-#data types
-from jax import Array
-from typing import Callable, Tuple
+from rmvae.setup import *
 
 #%% Save Model
 

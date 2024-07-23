@@ -73,9 +73,10 @@ def elbo_euclidean(x:Array,
 
 #%% Riemannian Distance ELBO
 
-@partial(jit, static_argnames=['vae_model', 'training_type'])
+@partial(jit, static_argnames=['vae_model', 'G_model', 'dist_fun', 'training_type'])
 def elbo_distance(x:Array,
                   vae_model:Callable[[Array], Array],
+                  G_model:Callable[[Array], Array],
                   dist_fun:Callable[[Array, Array], Array],
                   training_type:str="All"
                   )->Tuple[Array, [Array, Array]]:
@@ -112,9 +113,9 @@ def elbo_distance(x:Array,
         
         return 0.5*jnp.mean(log_pz-log_qzx)
 
-    z, mu_xz, log_sigma_xz, mu_zx, log_t_zx, mu_z, log_t_z, dW, dt, \
-        z_prior, dW_prior, dt_prior, G_mu_zx, G_mu_z = vae_model(x)
-    
+    z, mu_xz, log_sigma_xz, mu_zx, log_t_zx, mu_z, log_t_z, *_ = vae_model(x)
+    G_mu_zx = G_model(mu_zx)
+    G_mu_z = G_model(mu_z)
 
     if training_type == "Encoder":
         log_sigma_xz = lax.stop_gradient(log_sigma_xz)
